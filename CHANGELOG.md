@@ -3,6 +3,150 @@
 All notable changes to Provome are recorded here. Versions follow
 semantic versioning.
 
+## [0.22.0] - 2026-11-27
+
+Cross-source provider: the corpus gains a genuine second
+independence group (the Item 53 structural gap, closed on the
+gate's own terms). New module `provome/cross_source.py`
+(+12 tests): a `CrossSourceProvider` that merges, for one
+Human-division variant question, literature evidence from the
+local Europe PMC corpus (group `europepmc`, via the existing
+`CorpusProvider`) with structured variant evidence from the
+existing live provider machinery — ClinVar's curated
+classification (group `ncbi-clinvar`) and gnomAD's population
+frequency (group `gnomad`). Merged items are retagged onto
+the variant topic key (`CFTR:p.Phe508del` form) so the gate
+sees one topic. The cite-or-decline gate is UNCHANGED: no
+change to `evaluate_gate`, its thresholds, or its counting,
+and no change to `provome/evidence.py` at all. Groups are
+counted only by the existing source registry; no source is
+relabelled as two.
+
+Independence, and its guard. ClinVar (NCBI), gnomAD (Broad),
+and Europe PMC (EMBL-EBI) are different operators running
+different curation pipelines over different underlying data —
+submitted interpretations, counted population frequencies,
+published reports — so an error or fabrication in one does
+not appear in another by construction. Against the same
+evidence line arriving twice, two defences: the gate's own
+canonical-record deduplication (same PMID or same ClinVar
+Variation ID under one topic counts once, whichever provider
+served it), and a record-report absorption guard in the
+composite: a verified supporting corpus item whose title
+names ClinVar and the variant (any accepted notation) is a
+report OF the ClinVar record, and when a ClinVar item for
+the variant is in the merged set it is carried as UNVERIFIED
+with the reason in its notes and counted on the provider
+(`absorbed_duplicate_records`) — visible for audit, unable
+to manufacture the second group. The guard is deliberately
+narrow and errs toward decline: it can demote a genuinely
+independent paper whose title names ClinVar and the variant.
+What it does NOT catch, stated plainly: a ClinVar submission
+often rests on a published paper that is itself in the
+corpus, and the served ClinVar esummary record does not
+expose its publication links — a corpus paper that is the
+submission's own source, but whose title names neither
+ClinVar nor the record, is undetectable with the records the
+live machinery serves. Resolving ClinVar's publication
+cross-references per record is future work. A two-group pass
+from this provider therefore means "a curated classification
+plus verified literature with no detected record-level
+duplication", not proof that no underlying study is shared.
+
+Deliberate exclusions. The live provider's literature items
+are NOT merged: literature reached through a second index is
+not structured independence, and the same paper can arrive
+through both indexes. gnomAD items are NEUTRAL, so they never
+supply the passing group; in practice the second supporting
+group is ClinVar, and a variant ClinVar classifies as
+uncertain or conflicting declines — correctly. Scope is the
+Human division only (the constructor refuses a non-Human
+corpus; the Copilot's division guard declines Animal/Plant
+questions before retrieval): Animal and Plant second groups
+are future work, not faked here. Questions without a gene
+and HGVS variant get corpus-only behaviour, unchanged from
+0.21.0. Tests are fixture-based (synthetic corpus + fixture
+live transport, no network): corpus + ClinVar passes with
+citations from both groups; removing the structured item
+restores the group-rule decline; an all-record-report corpus
+is fully absorbed and the decline stands; one absorbed
+duplicate among genuine papers does not block a legitimate
+pass; division scoping holds; the public benchmark still
+reproduces exactly (49/49, probe-set hash b44d2ee6…).
+
+Real smoke run (outside the test suite) against the actual
+2,226,953-record corpus plus the LIVE structured sources
+(NCBI was reachable from this machine; ClinVar records below
+were fetched 2026-11-27 via NCBI E-utilities), through
+`Copilot(provider=CrossSourceProvider(...))`. Output
+verbatim:
+
+    [DECLINE] division: Human
+    Q: CFTR Phe508del cystic fibrosis transmembrane conductance regulator
+    Topic: corpus:cftr phe508del cystic fibrosis transmembrane conductance regulator
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=11 absorbed_duplicate_records=0 elapsed=100.6s]
+
+    [ANSWER] division: Human
+    Q: What is known about CFTR p.Phe508del and cystic fibrosis?
+    Topic: CFTR:p.Phe508del
+    Evidence: 12 verified item(s) from 2 independent source group(s); confidence (heuristic): 0.84
+    - ClinVar records NM_000492.4(CFTR):c.1522_1524del (p.Phe508del) with germline classification: Pathogenic (review status: criteria provided, single submitter).
+      Source: ClinVar Variation ID 4072070 (fetched 2026-11-27 via NCBI E-utilities) (https://www.ncbi.nlm.nih.gov/clinvar/variation/4072070/)
+    - ClinVar records NM_000492.3(CFTR):c.1521_1523del (p.Phe508del) with germline classification: Pathogenic (review status: practice guideline).
+      Source: ClinVar Variation ID 7105 (fetched 2026-11-27 via NCBI E-utilities) (https://www.ncbi.nlm.nih.gov/clinvar/variation/7105/)
+    - Report on the p.Ser489X (p.Ser489*) CFTR mutation, a variant with severe associated phenotype and high prevalence in a Quebec French-Canadian cystic fibrosis patient population.
+      Source: PMID 22627569. Report on the p.Ser489X (p.Ser489*) CFTR mutation, a variant with severe associated phenotype and high prevalence in a Quebec French-Canadian cystic fibrosis patient population. Genetics in medicine : official journal of the American College of Medical Genetics, 2012. (https://europepmc.org/article/MED/22627569)
+    - Heterogeneity in the severity of cystic fibrosis and the role of CFTR gene mutations.
+      Source: PMID 7513291. Heterogeneity in the severity of cystic fibrosis and the role of CFTR gene mutations. Human genetics, 1994. (https://europepmc.org/article/MED/7513291)
+    - Genetically engineered approaches to the treatment of cystic fibrosis.
+      Source: PMID 41613863. Genetically engineered approaches to the treatment of cystic fibrosis. Biophysical reviews, 2025. (https://europepmc.org/article/MED/41613863)
+    - CFTR complex alleles and phenotypic variability in cystic fibrosis disease.
+      Source: PMID 39262237. CFTR complex alleles and phenotypic variability in cystic fibrosis disease. Cellular and molecular biology (Noisy-le-Grand, France), 2024. (https://europepmc.org/article/MED/39262237)
+    - Newborn cystic fibrosis screening in southeastern Mexico: Birth prevalence and novel CFTR gene variants.
+      Source: PMID 28992757. Newborn cystic fibrosis screening in southeastern Mexico: Birth prevalence and novel CFTR gene variants. Journal of medical screening, 2018. (https://europepmc.org/article/MED/28992757)
+    - Targeted therapies to improve CFTR function in cystic fibrosis.
+      Source: PMID 26403534. Targeted therapies to improve CFTR function in cystic fibrosis. Genome medicine, 2015. (https://europepmc.org/article/MED/26403534)
+    - Personalized Medicine in Cystic Fibrosis: Characterization of Eight Rare CFTR Variants in Intestinal Organoids and Cellular Models.
+      Source: PMID 40944809. Personalized Medicine in Cystic Fibrosis: Characterization of Eight Rare CFTR Variants in Intestinal Organoids and Cellular Models. Molecular diagnosis & therapy, 2026. (https://europepmc.org/article/MED/40944809)
+    - Molecular Diagnosis of Cystic Fibrosis.
+      Source: PMID 26724724. Molecular Diagnosis of Cystic Fibrosis. Current protocols in human genetics, 2016. (https://europepmc.org/article/MED/26724724)
+    - Cystic fibrosis.
+      Source: PMID 27189798. Cystic fibrosis. Nature reviews. Disease primers, 2015. (https://europepmc.org/article/MED/27189798)
+    - Evaluation of eluforsen, a novel RNA oligonucleotide for restoration of CFTR function in in vitro and murine models of p.Phe508del cystic fibrosis.
+      Source: PMID 31251792. Evaluation of eluforsen, a novel RNA oligonucleotide for restoration of CFTR function in in vitro and murine models of p.Phe508del cystic fibrosis. PloS one, 2019. (https://europepmc.org/article/MED/31251792)
+    [provider: dropped_records=0 out_of_division_records=21 absorbed_duplicate_records=0 elapsed=128.4s]
+
+Honest limits, stated plainly. (1) The first question — the
+0.21.0 smoke question, verbatim — still DECLINES: it names
+no HGVS variant, so the structured side has no target and
+the question gets corpus-only behaviour. The cross-supply
+engages when the question names a gene and a variant in
+HGVS notation, which is the live machinery's standing
+intent-validation rule, not a new restriction. (2) The
+second question ANSWERED with 12 verified items from 2
+groups: two live ClinVar records (Variation IDs 4072070 and
+7105, both Pathogenic for CFTR p.Phe508del, on different
+transcript versions — the live provider's own
+one-item-per-interpretation-line rule kept them distinct
+because their classifications' review statuses differ) and
+ten corpus literature items. This is the first Copilot
+answer in which corpus evidence counted toward a pass.
+(3) The absorption guard fired zero times in this run
+(absorbed_duplicate_records=0): none of the ten retrieved
+titles names ClinVar. The guard's real-world firing rate is
+therefore still unobserved; its behaviour is established by
+the fixture tests, not by this run. (4) Latency is unchanged
+in character: 100.6s and 128.4s per question, dominated by
+the corpus provider's streaming record scan (0.21.0 limit
+(3) stands; an offset index remains future work). (5)
+VERIFIED on corpus items still means the corpus standard
+(PMID + abstract at ingest, re-checked at read), not a live
+re-confirmation; ClinVar items are verified at fetch under
+the live provider's existing standard. Suite: 522 passed
+(510 at 0.21.0, +12 new).
+
 ## [0.21.0] - 2026-11-27
 
 Corpus-backed Copilot provider (LLM track Stage A remainder,
