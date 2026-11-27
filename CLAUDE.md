@@ -115,3 +115,55 @@ python3 scripts/precommit_guard.py
 An override is an auditable Founder act: state the reason in the
 commit message. An agent must never set the override on its own
 initiative.
+
+## State of the build (updated by Leo, 2026-11-27)
+
+**Full handover — read this first if you are picking Provome up cold:**
+`~/workspace/provome-hardening/HANDOVER_TO_CLAUDE_2026-11-27.md`
+(everything built, every measured number with its source file, all
+standing decisions, and every open gap stated plainly).
+
+- Latest shipped version: **0.21.0** (working tree, not yet
+  committed). Full suite: **510 passed** (`python -m pytest tests/
+  -q`; if pytest is missing use a throwaway venv with the package's
+  test extra — the package itself stays zero-dependency).
+- Public benchmark (Item 57): 49 frozen probes, preregistered hash
+  `b44d2ee6e3fafdeca42c0d401ca92f1b561162685fae2d1290e15f389543bc13`;
+  gate 49/49, confirmer 49/49, always-decline 25/49, always-answer
+  20/49, failure register empty. The confirmer is an internal
+  stand-in, NOT a human baseline — real human labels: zero so far.
+- Verified corpus (Item 53): 2,226,953 PMID-verified records
+  indexed at `~/workspace/provome-corpus/`; its 30-question
+  evaluation passed the gate 0/30 for one true reason — a single
+  source group. Never weaken the gate to change that number.
+- Install proof: Linux TESTED–PASS; macOS TESTED–PASS
+  (2026-11-27, the Founder's own MacBook Air, wheel install,
+  hash and all four benchmark systems identical to Linux);
+  Windows NOT tested; HPC notes only
+  (`~/workspace/provome-hardening/INSTALL_PROOF_2026-11-27.md`).
+- Shipped after the handover was written (2026-11-27, same night):
+  **v0.20.0** human-labelling kit (`provome/labelling.py` — blind
+  export with sealed verdicts, hash-bound label ingest, partial-set
+  scoring on the labelled denominator only; zero real labels
+  collected so far) and **v0.21.0** corpus-backed Copilot provider
+  (`provome/corpus_provider.py` — retrieves from the local corpus
+  index, re-verifies PMID+abstract at read time, gate unchanged).
+  Real-corpus smoke run: 3/3 questions DECLINED, each solely on
+  the 1-source-group rule, with ≥3 verified items retrieved every
+  time; ~80–97 s/question in pure Python (known perf gap).
+  Step 8 (billing/checkout) is paperwork-only so far —
+  no billing code exists.
+- Standing orders that bind any agent here: the Founder Witness
+  Gate (nothing published until the Founder has seen the data and
+  says so), US-only collaboration partners, the Undermind
+  introduction is drafted and HELD — never send it, and quantum
+  work stays outside this package.
+- **A letter is waiting for Claude** at
+  `~/workspace/provome-hardening/ASK_CLAUDE_2026-11-27.md` — eight
+  questions the Founder ordered asked (second source group, gate
+  arithmetic, benchmark circularity, performance vs the
+  zero-dependency rule, single-labeller honesty, product sequence,
+  blind spots, code health). Answer it in writing at
+  `~/workspace/provome-hardening/CLAUDE_REPLY_2026-11-27.md`,
+  one section per question, claims cited to files. Advice only in
+  that pass: do not edit the gate, tests, fixtures, or roadmap.

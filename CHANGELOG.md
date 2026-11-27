@@ -3,6 +3,210 @@
 All notable changes to Provome are recorded here. Versions follow
 semantic versioning.
 
+## [0.21.0] - 2026-11-27
+
+Corpus-backed Copilot provider (LLM track Stage A remainder,
+Item 30; the Item 53 corpus put to work). New module
+`provome/corpus_provider.py` (+9 tests): a Copilot
+EvidenceProvider that retrieves from the LOCAL Item 53 corpus
+index on disk — the TF-IDF CSR matrix, vocabulary, and row
+PMIDs at `~/workspace/provome-corpus/` — with no network at
+query time and no new dependency: the `.npz` members are
+extracted to a configurable scratch directory (~2.4 GB at
+this scale) and memory-mapped, the `.npy` headers parsed
+directly, and search runs over the CSR columns the query's
+terms touch. Records are fetched by streaming scan of
+`corpus.jsonl.gz` (a record's row is its line number).
+Every retrieved record is re-checked at answer time against
+the corpus's own verified standard — the Item 53 ingest
+rule applied again: real PMID present, non-empty abstract
+present, and the record's PMID matching its index row. A
+record failing any check is dropped and counted on the
+provider (`dropped_records`); division filtering by the
+records' primary-division tags is counted separately
+(`out_of_division_records`). Europe PMC is registered in
+the source registry as exactly one independence group, and
+every corpus item carries it as its source. The
+cite-or-decline gate is UNCHANGED and is not weakened for
+this provider. Tests run against a small synthetic fixture
+corpus built in the test file in the exact on-disk layout
+(never the real corpus): retrieval finds the planted
+records, the planted no-abstract and no-PMID records are
+dropped and counted (2), a Human provider never serves
+Plant records, and the gate declines corpus-only evidence
+on the group rule with three verified items in hand.
+
+Real smoke run (outside the test suite) against the actual
+2,226,953-record corpus, three questions from the Item 53
+evaluation set, one per division, through
+`Copilot(provider=CorpusProvider(...))`. Output verbatim:
+
+    [DECLINE] division: Human
+    Q: CFTR Phe508del cystic fibrosis transmembrane conductance regulator
+    Topic: corpus:cftr phe508del cystic fibrosis transmembrane conductance regulator
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=11 elapsed=97.2s]
+
+    [DECLINE] division: Animal
+    Q: ABCB1 MDR1 mutation dog ivermectin sensitivity collie
+    Topic: corpus:abcb1 mdr1 mutation dog ivermectin sensitivity collie
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=173 elapsed=84.2s]
+
+    [DECLINE] division: Plant
+    Q: FLC Arabidopsis flowering locus vernalization repression
+    Topic: corpus:flc arabidopsis flowering locus vernalization repression
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=12 elapsed=78.9s]
+
+Honest limits, stated plainly. (1) All three questions
+DECLINED, each on the single group rule and no other: in
+every case at least three verified items were retrieved, so
+the declines are the Item 53 structural result reproduced
+through the Copilot — single-source evidence (Europe PMC
+alone = 1 independent group) cannot pass a two-group gate.
+The known next gap is a second independent source group
+(ClinVar/gnomAD cross-supply); it is future work and was
+not built here, and the gate was not weakened to hide it.
+(2) VERIFIED on corpus items means the corpus standard —
+PMID + abstract required at ingest, re-checked at read —
+not a live re-confirmation; this provider makes no network
+calls and does not repeat the pipeline evaluation's live
+PubMed check per query. (3) Query terms are weighted
+uniformly (per-term document frequencies are not stored in
+the index artefacts); document vectors carry the corpus
+idf. (4) Latency is ~80-97 s per question in pure Python
+(column scans plus a streaming record fetch) — the Item 53
+evaluation's 0.348 s mean was numpy machinery over the same
+index, not this provider; an offset index for record lookup
+is future work. Suite 510.
+
+## [0.20.0] - 2026-11-27
+
+Human-labelling kit for the public benchmark (Item 51
+blind-human-labels standard; the Item 57 road's named
+remainder). New module `provome/labelling.py` (+18 tests).
+Blind export: `build_labelling_pack` exports all 49 frozen
+probes as a labelling pack — per probe ONLY the id, division,
+question, and the evidence items the scored run's own
+providers serve for it. Expected verdicts, ground-truth
+notes, and checking sources are never read into the pack, so
+they cannot leak into it; a test scans both exported forms
+(JSONL and the Markdown sheet) for every probe's ground
+truth and source URL and asserts their absence, and asserts
+each record carries only the blind fields. The probe-set
+hash is recorded in the pack header, and the Markdown
+sheet's header is the labeller instructions: what the three
+labels (answer / decline / disclose) mean, judge the shown
+evidence not outside knowledge, ~one sitting for 49 probes.
+Ingest + scoring: a labels file (labeller identity, date,
+probe-set hash, probe-id → label map) parses into
+`HumanLabels` and is scored by `run_benchmark(...,
+human_labels=...)`, which refuses loudly — before any probe
+runs — when the labels' hash does not match the frozen set
+or a label names a probe the set does not contain. The
+report gains an OPTIONAL `human_baseline` section: absent
+when no labels are supplied (the v2 confirmer caveat stands
+unchanged), present when they are, carrying
+human-vs-gate and human-vs-expected agreement as Rate
+fractions with denominators and Wilson intervals, per
+division and overall. Partial label sets are scored on the
+labelled subset only, the labelled denominator stated, an
+unlabelled division reporting n=0 with no rate; the section
+names the labeller and the labelled count ("N of 49"), and
+the confirmer caveat switches to a text that keeps real
+human labels distinct from the confirmer stand-in. No
+labels ship with this release and none were fabricated:
+the only labels exercised anywhere are synthetic fixtures
+inside the test file, marked as such in their labeller
+string. The first real baseline waits for a named person
+labelling blind from this pack. Suite 501.
+
+## [0.19.0] - 2026-11-27
+
+Public benchmark v2 (roadmap Item 57, remainder; Item 51
+confirmer-calibration standard). The frozen probe set grows
+from 17 to 49 probes (Human 13, Animal 18, Plant 18; 20
+answer, 25 decline, 4 disclose), preregistered under a new
+hash (b44d2ee6e3fafdeca42c0d401ca92f1b561162685fae2d1290
+e15f389543bc13). New Human probes are grounded in variants
+already used in this repo: FGFR3 p.Gly380Arg (the bundled
+worked examples' achondroplasia variant; ClinVar, OMIM
+#100800) as an answer probe, an HBB p.Glu6Val disagreement
+probe, and fabricated-variant, fabricated-gene (FAKGENE1),
+and wrong-division traps in the existing families. New
+Animal and Plant probes are selected by name from those
+divisions' own frozen benchmarks, so their ground truth
+stays single-sourced. Every division now carries disclosure
+probes: Animal (sheep PRNP / Nor98 atypical scrapie,
+Benestad et al. 2003) and Plant (rice XA21 developmental
+regulation, Century et al. 1999) reach theirs through a
+disclosure fixture wrapper that adds the one published
+refuting record to the division provider's own recorded
+items — necessary because the divisions' live providers
+emit supporting items only, and stated here rather than
+hidden. Scores as measured: gate verdict 49/49 overall
+(Human 13/13, Animal 18/18, Plant 18/18; 95% CI 93-100%),
+answer 20/20, decline 25/25, disclosure 4/4 (Human 2/2,
+Animal 1/1, Plant 1/1 — no division reports disclosure
+0/0 anymore). New confirmer calibration baseline: an
+independent re-derivation of the gate rule (its own
+counting code; never calls the gate, never touches a
+Copilot) scored in the same `systems` tuple — confirmer
+49/49, gate/confirmer agreement 49/49 (95% CI 93-100%).
+Trivial-baseline floor: always-decline 25/49, always-answer
+20/49. Failure register: explicitly empty. Honest limits,
+stated in the release: the confirmer implements the same
+written rule as the gate, so agreement measures
+implementation consistency — it is NOT a human baseline,
+no human labels exist for this probe set yet, and every
+report now carries that caveat verbatim alongside the v1
+caveat; the probe set remains fixed and builder-chosen;
+the Human fixture remains a small hand-built provider over
+published facts. A test proves the confirmer can disagree
+with the gate (a duplicated evidence line the gate
+collapses and the confirmer counts), so the calibration
+check is a check, not a rubber stamp. Nothing is
+published from this run until the Founder Witness Gate.
+Suite 483.
+
+## [0.18.0] - 2026-11-27
+
+Public benchmark v1 (roadmap Item 57; Item 38 in buildable
+form, Item 51 standards). `provome/public_benchmark.py`: 17
+frozen probes across the three divisions (Human 7, Animal 5,
+Plant 5; 6 answer, 10 decline, 1 disclose), built from public
+records only - published ClinVar variants already used in this
+repo's live demos (CFTR p.Phe508del, HBB p.Glu6Val), OMIM/OMIA
+entries, and the divisions' own recorded Ensembl/Europe PMC
+fixtures; no patient data, no network in the scored run.
+Preregistration: the probe set is hashed (canonical JSON,
+SHA-256) before the run, the hash is recorded in the report,
+and a run handed a mismatched preregistered hash refuses.
+Every score is an x/n fraction with a Wilson 95% interval -
+no bare percentages anywhere in the report structure.
+Trivial-baseline floor: always-decline scores 10/17 and
+always-answer 6/17 (both 0/1 on disclosure) in the same
+`systems` tuple as the gate, so the gate's score cannot be
+quoted without the floor beside it. Failure register: every
+miss is a record with expected vs actual and a cause class
+from a fixed five-class taxonomy; the gate's register this
+run is explicitly empty. Scores as measured: gate verdict
+17/17 overall (Human 7/7, Animal 5/5, Plant 5/5), answer
+6/6, decline 10/10, disclosure 1/1 (Human only; Animal and
+Plant carry no disclose probes and report 0/0, no score -
+a division with zero probes is never given an invented
+number). Honest limits, stated in the release: the probe set
+is fixed and builder-chosen, the Human fixture is a small
+hand-built provider over published facts, and the report
+carries the caveat verbatim that fixture/public-probe
+results are a benchmark of gate behaviour, not external
+clinical validation. Nothing is published from this run
+until the Founder Witness Gate. Suite 478.
+
 ## [0.17.0] - 2026-11-25
 
 Three-doors packaging v1 (roadmap Item 31 in installable

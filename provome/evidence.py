@@ -284,6 +284,22 @@ def _production_sources() -> list[Source]:
                 peer_reviewed=True,
             ),
             Source(
+                source_id="europepmc",
+                name="Europe PMC",
+                independence_group="europepmc",
+                description=(
+                    "EMBL-EBI Europe PMC: the literature index "
+                    "the Provome corpus (Item 53) was built "
+                    "from. Records drawn from this one index "
+                    "form exactly one independence group, "
+                    "however many records a retrieval returns: "
+                    "one index is one source, and the gate "
+                    "counts it once."
+                ),
+                base_url="https://europepmc.org/",
+                peer_reviewed=True,
+            ),
+            Source(
                 source_id="omim",
                 name="OMIM",
                 independence_group="omim",
