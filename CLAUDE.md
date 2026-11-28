@@ -123,8 +123,9 @@ initiative.
 (everything built, every measured number with its source file, all
 standing decisions, and every open gap stated plainly).
 
-- Latest shipped version: **0.21.0** (working tree, not yet
-  committed). Full suite: **510 passed** (`python -m pytest tests/
+- Latest shipped version: **0.24.0** (committed: df21832 for
+  v0.18.0–v0.21.0, 783ca0b for v0.22.0, b4658a7 for v0.23.0;
+  v0.24.0 is the commit carrying this line). Full suite: **554 passed** (`python -m pytest tests/
   -q`; if pytest is missing use a throwaway venv with the package's
   test extra — the package itself stays zero-dependency).
 - Public benchmark (Item 57): 49 frozen probes, preregistered hash

@@ -47,6 +47,11 @@ from provome.evidence import VerificationStatus, evaluate_gate
 from provome.live import LiveEvidenceProvider
 from provome.public_benchmark import run_benchmark
 from provome.rag import _tokenise
+from provome.source_providers import (
+    EnaProvider,
+    OpenTargetsProvider,
+    RcsbPdbProvider,
+)
 
 FIXED_DATE = date(2026, 11, 27)
 
@@ -289,12 +294,42 @@ def empty_transport(url, body=None):
     raise AssertionError(f"unexpected URL: {url}")
 
 
+def _empty_payload_transport(payload):
+    def transport(url, body=None):
+        return payload
+
+    return transport
+
+
 def make_composite(corpus_dir, transport=cftr_transport):
     corpus = CorpusProvider(corpus_dir)
     structured = LiveEvidenceProvider(
         transport=transport, today=lambda: FIXED_DATE
     )
-    return CrossSourceProvider(corpus, structured)
+    # v0.24.0: the composite also wires the registered sources
+    # (Open Targets / ENA / RCSB PDB), whose defaults are live.
+    # These tests specify the v0.22.0 world — corpus plus
+    # structured side only — so the registered sides are
+    # pinned to empty fixture worlds and the gene resolver to
+    # one that resolves nothing.  The wiring itself is under
+    # test in test_cross_source_registered.py.
+    return CrossSourceProvider(
+        corpus,
+        structured,
+        opentargets_provider=OpenTargetsProvider(
+            transport=_empty_payload_transport({}),
+            today=lambda: FIXED_DATE,
+        ),
+        ena_provider=EnaProvider(
+            transport=_empty_payload_transport([]),
+            today=lambda: FIXED_DATE,
+        ),
+        rcsb_provider=RcsbPdbProvider(
+            transport=_empty_payload_transport({}),
+            today=lambda: FIXED_DATE,
+        ),
+        gene_resolver=lambda symbol: None,
+    )
 
 
 @pytest.fixture()

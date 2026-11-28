@@ -3,6 +3,76 @@
 All notable changes to Provome are recorded here. Versions follow
 semantic versioning.
 
+## [0.24.0] - 2026-11-28
+
+The three sources registered in 0.23.0 are wired into the
+Copilot's default multi-source chain — the cross-source
+composite in `provome/cross_source.py` — each only where it
+genuinely serves the question the chain can actually pose
+(+18 tests in `tests/test_cross_source_registered.py`; the
+0.22.0 composite tests now pin the registered sides to empty
+fixture worlds, assertions unchanged, so the suite stays
+fully offline):
+
+* **Open Targets** (group `opentargets`) joins the merge
+  for variant topics. The topic names its gene; the
+  composite resolves the gene to its Ensembl gene ID via
+  the Ensembl REST symbol lookup the Animal and Plant
+  providers already use — addressing only, never evidence,
+  failure-closed — and fetches the Platform's gene–disease
+  associations. Items are retagged onto the variant topic
+  exactly as corpus items are, with their statements
+  unrewritten: what they support is the *gene's*
+  association with the disease, and they can supply the
+  gate's second group under their own registry group.
+  The caveat is stated, not buried: the Platform
+  integrates upstream records (ClinVar via EVA, Europe PMC
+  literature among them), so a pass in which Open Targets
+  supplies the second group means a scored platform
+  association stands alongside the other verified
+  evidence — not that two wholly disjoint data lineages
+  agree. The registry counts it as one group, counted
+  once; the wiring follows the registry.
+* **ENA** (group `ena`): a question naming a sequencing
+  run accession (SRR/ERR/DRR …) routes to an `ena:` topic
+  and the composite serves the archive record for that
+  run. The items are NEUTRAL provenance, so the Copilot
+  declines — now with the verified record shown in the
+  chain's items instead of declined blind. An archive
+  record can never manufacture a pass: the gate counts
+  groups among supporting items only.
+* **RCSB PDB** (group `rcsb-pdb`): a question naming a
+  PDB entry in a structure context (a PDB-shaped token
+  together with the word "PDB" or "structure" — the
+  context requirement keeps a stray four-character token
+  from hijacking a question) routes to an `rcsb:` topic
+  and serves the structure record the same way, NEUTRAL,
+  decline-with-the-record-shown.
+
+Division scoping, honestly. Open Targets is a human
+gene–disease resource, wired as Human evidence only —
+which is all the composite can issue, as it is
+Human-scoped and the Copilot's division guard declines
+Animal and Plant questions before retrieval. ENA and
+RCSB PDB records are species-agnostic (both archives hold
+animal and plant records too), but in this release they
+are wired into this Human-scoped chain only: the Animal
+and Plant doors run their own division providers, whose
+composition this release does not change, and no Animal
+or Plant coverage is claimed for any of the three
+sources. Gene-only questions (a gene named with no
+variant) do not consult Open Targets: the chain's only
+gene recognition is the variant parser, and no bare-gene
+recogniser was invented to widen the wiring.
+
+The cite-or-decline gate is UNCHANGED: no change to
+`provome/evidence.py` at all in this release — no
+threshold, counting, or registry change. Single-group
+evidence still declines in the wired chain; fabricated
+genes and accessions still decline through it. Suite:
+554 passed (536 at 0.23.0, +18), including the public
+benchmark gate at 49/49.
+
 ## [0.23.0] - 2026-11-27
 
 Source expansion, ordered by the Founder ("Verify and if useful
