@@ -3,6 +3,66 @@
 All notable changes to Provome are recorded here. Versions follow
 semantic versioning.
 
+## [0.23.0] - 2026-11-27
+
+Source expansion, ordered by the Founder ("Verify and if useful
+make it").  Five candidate public APIs from the public-apis
+catalog were verified live on 2026-11-27 — real queries, no
+keys, licences read on each provider's own pages — and the
+three that are both useful and licence-clean are now
+registered sources with a tested retrieval layer.  New module
+`provome/source_providers.py` (+14 tests):
+
+* **Open Targets Platform** (group `opentargets`): harmonised
+  gene–disease association evidence.  Verified live: CFTR
+  (ENSG00000001626) returned 1,889 associated diseases, cystic
+  fibrosis (MONDO_0009061) at overall score 0.921.  Data is
+  CC0 1.0 per the Platform licence page.  Independence, stated
+  with its caveat: the Platform is one integration pipeline,
+  so it is one group, counted once; it integrates upstream
+  records (ClinVar via EVA, Europe PMC literature among
+  them), so an Open Targets item is the Platform's own scored
+  association, not a re-derivation from those records'
+  primary sources.
+* **European Nucleotide Archive** (group `ena`): sequence
+  archive records (INSDC) across all divisions.  Verified
+  live: taxon 9606 and the full read-run record SRR1039508
+  (study PRJNA229998, 22,935,521 reads).  Terms: EMBL-EBI
+  Terms of Use — no restriction beyond the data owner's,
+  attribution expected.  Items are NEUTRAL provenance
+  evidence: an archive record supports no disease claim.
+* **RCSB Protein Data Bank** (group `rcsb-pdb`): structure
+  records.  Verified live: entry 4HHB (human
+  deoxyhaemoglobin, 1.74 Å).  Data and API output are CC0
+  1.0 per the RCSB PDB Usage Policies.  Items are NEUTRAL
+  structural context.
+
+Two candidates were verified live and deliberately NOT
+registered.  **KEGG is held on licence grounds**: its
+Copyright and Disclaimer page states "Non-academic use of
+KEGG requires a commercial license", and Provome is a
+commercial venture.  **MyGene.info is not an evidence
+source**: it aggregates other databases' annotations, and
+the registry has no non-evidence plumbing category to hold
+it honestly.  Both decisions are pinned by a test and
+recorded in `docs/LICENSE_REGISTER.md`, which also gains
+verified rows for the three registered sources.
+
+The cite-or-decline gate is UNCHANGED: no change to
+`evaluate_gate`, its thresholds, or its counting.  The only
+change to `provome/evidence.py` is the three new entries in
+the production source registry — the Europe PMC registration
+pattern — made under the Founder's explicit order for this
+work; the pre-commit guard override is used for that reason
+alone and is named in the commit message.  Verification in
+the new providers is verification at fetch, as in the live
+provider; the known gap stands (no independent confirmer
+for non-literature items) and is not described as closed.
+The new providers are not wired into the Copilot's default
+provider chain; that is a separate decision, still to be
+made explicitly.  Suite: 536 passed (522 at 0.22.0, +14),
+including the public benchmark gate at 49/49.
+
 ## [0.22.0] - 2026-11-27
 
 Cross-source provider: the corpus gains a genuine second

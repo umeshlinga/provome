@@ -354,6 +354,60 @@ def _production_sources() -> list[Source]:
                 ),
                 base_url="https://rest.ensembl.org/",
             ),
+            Source(
+                source_id="opentargets",
+                name="Open Targets Platform",
+                independence_group="opentargets",
+                description=(
+                    "Open Targets Platform: harmonised gene-disease "
+                    "association evidence, integrating genetics, "
+                    "somatic, drug, pathway and literature sources "
+                    "into scored target-disease associations. "
+                    "Platform data is CC0 (verified against the "
+                    "Platform licence page, 2026-11-27). One "
+                    "integration pipeline is one independence "
+                    "group, however many associations a query "
+                    "returns; and because the Platform integrates "
+                    "upstream records (ClinVar via EVA and Europe "
+                    "PMC literature among them), an Open Targets "
+                    "item is the Platform's own scored association, "
+                    "not a re-derivation from those records' "
+                    "primary sources."
+                ),
+                base_url="https://platform.opentargets.org/",
+            ),
+            Source(
+                source_id="ena",
+                name="European Nucleotide Archive",
+                independence_group="ena",
+                description=(
+                    "EMBL-EBI European Nucleotide Archive (an INSDC "
+                    "partner archive): raw sequencing reads, "
+                    "assembled genomes and annotated sequence "
+                    "records across all divisions, served under "
+                    "the EMBL-EBI Terms of Use (checked "
+                    "2026-11-27). An archive record attests that "
+                    "a dataset exists and what it describes; it "
+                    "is provenance evidence, counted once under "
+                    "its own group."
+                ),
+                base_url="https://www.ebi.ac.uk/ena/",
+            ),
+            Source(
+                source_id="rcsb-pdb",
+                name="RCSB Protein Data Bank",
+                independence_group="rcsb-pdb",
+                description=(
+                    "RCSB Protein Data Bank (wwPDB): experimentally "
+                    "determined 3D structures of proteins and "
+                    "nucleic acids. Archive and API data are CC0 "
+                    "(RCSB PDB Usage Policies, checked 2026-11-27). "
+                    "A structure record is structural context for "
+                    "a gene or protein, counted once under its "
+                    "own group."
+                ),
+                base_url="https://www.rcsb.org/",
+            ),
         ]
     )
 
