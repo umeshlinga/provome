@@ -3,6 +3,131 @@
 All notable changes to Provome are recorded here. Versions follow
 semantic versioning.
 
+## [0.26.0] - 2026-11-28
+
+Corpus latency (the Item 57 §4c recorded gap): the pure-Python
+corpus provider path cut from ~73–79 s per question to
+~9–11 s in steady state, with no change to any retrieval
+result.  Profile first, on one real Human question against
+the Item 53 corpus (phase timers, pre-fix code): index load
+38.2 s (`.npz` extraction), search 34.7 s, record fetch
+34.1 s; under cProfile the full ask took 194 s, of which
+`mmap.find` alone was 95.0 s — one full byte scan of the
+1.17 GB indices payload per query column, plus a streaming
+decompression of the whole corpus for every fetch.  Three
+fixes, all in `provome/corpus_provider.py`:
+
+* **Search scans once.**  `_CorpusIndex.search` now collects
+  every query column's entry positions in a single
+  alternation pass over the indices payload
+  (`_positions_by_column`) instead of one full-payload byte
+  search per column.  The positions per column are exactly
+  the per-column search's yield: an occurrence can hide
+  inside the span of an unaligned match the pass consumes,
+  so the one aligned offset inside each such span is checked
+  explicitly; every candidate is verified against the
+  payload itself; and scores accumulate in the original
+  order (ascending column, ascending entry), so the sums
+  are the same floats, not merely close ones.
+* **Extraction is reused.**  With `scratch_dir` configured,
+  the scratch directory is keyed on the index and corpus
+  artefacts (path, size, modification time) and the `.npy`
+  payloads are extracted once — staged and published by
+  atomic rename, reused whenever the member size matches —
+  instead of being re-extracted (~2.4 GB) by every provider
+  instance in every process.
+* **Records are fetched by offset.**  The first fetch
+  against a persistent scratch cache decompresses
+  `corpus.jsonl.gz` once into an uncompressed copy with a
+  per-line byte-offset index (copy 3,950,870,456 bytes,
+  offsets 17,815,624 bytes at Item 53 scale), validated
+  against the corpus file's size and modification time on
+  reuse; fetches then seek directly to the wanted lines.
+  Without a persistent scratch directory the original
+  streaming scan is used unchanged.  `abstract_for_pmid`
+  resolves rows through a PMID→row map (first row wins, as
+  `list.index` behaved) instead of a linear scan of the
+  2.2M-entry id list.
+
+Identity proof (+19 tests,
+`tests/test_corpus_provider_identity.py`): golden outputs
+captured from the pre-fix code on the fixture corpus —
+ranked rows at full float precision, served items field for
+field, provider counters, Copilot verdicts — are reproduced
+exactly by the streaming path and by the persistent-cache
+path, cold and warm; a slow dense reference computation over
+the fixture CSR arrays matches `search` float for float;
+fetch through the offset copy equals the streaming fetch
+record for record; and a crafted indices payload whose byte
+stream hides an aligned occurrence inside an unaligned
+match's span is retrieved only because of the patch-up
+(without it, the hit is demonstrably missed).
+
+Real smoke run (outside the test suite): the v0.21.0 three
+questions, one per division, through
+`Copilot(provider=CorpusProvider(...))`, fresh provider per
+question, one shared `scratch_dir`.  Before (v0.25.0):
+
+    [DECLINE] division: Human
+    Q: CFTR Phe508del cystic fibrosis transmembrane conductance regulator
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=22 elapsed=79.3s]
+
+    [DECLINE] division: Animal
+    Q: ABCB1 MDR1 mutation dog ivermectin sensitivity collie
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=346 elapsed=76.8s]
+
+    [DECLINE] division: Plant
+    Q: FLC Arabidopsis flowering locus vernalization repression
+    Declined. Reasons:
+    - verified supporting items come from 1 independent source group(s); the gate requires at least 2
+    [provider: dropped_records=0 out_of_division_records=24 elapsed=72.6s]
+
+After (this version), first-ever use of a fresh cache — the
+first question pays the one-time extraction and copy build:
+
+    [DECLINE] division: Human
+    [provider: dropped_records=0 out_of_division_records=22 elapsed=90.6s]
+    [DECLINE] division: Animal
+    [provider: dropped_records=0 out_of_division_records=346 elapsed=14.1s]
+    [DECLINE] division: Plant
+    [provider: dropped_records=0 out_of_division_records=24 elapsed=12.4s]
+
+After, with the cache warm (fresh providers, same
+`scratch_dir`):
+
+    [DECLINE] division: Human
+    [provider: dropped_records=0 out_of_division_records=22 elapsed=10.9s]
+    [DECLINE] division: Animal
+    [provider: dropped_records=0 out_of_division_records=346 elapsed=9.4s]
+    [DECLINE] division: Plant
+    [provider: dropped_records=0 out_of_division_records=24 elapsed=9.5s]
+
+Verdicts, decline reasons, topics, served item ids, verified
+counts, and provider counters are identical in every run
+(machine-checked diff of the run dumps).  All three
+questions still DECLINE on the single-group rule, as they
+must: nothing about the gate, the evidence standard, or the
+retrieval mathematics changed.
+
+Honest limits.  (1) The first question against a cold cache
+is slightly *slower* than before (90.6 s vs 79.3 s): it pays
+the one-time extraction and copy build; every later
+question — any division, any process — reuses them.
+(2) Steady state is ~9–11 s per question, not the Item 53
+evaluation's 0.348 s: that figure was numpy machinery over
+the same index, and what remains in the pure-Python path is
+parsing the 26 MB id list, the single payload pass (~4 s
+for these questions), and paging in the values the pass
+touches.  (3) The persistent cache needs ~6.3 GB of scratch
+at this scale (payloads ~2.4 GB + corpus copy ~4.0 GB); with
+no `scratch_dir` configured, behaviour and latency are the
+pre-fix ones.  Suite 593 passed, 3 flagged exceptions (the
+same class-3 red-team expectations as 0.25.0, untouched).
+
 ## [0.25.0] - 2026-11-28
 
 The fixes for the 2026-11-28 red-team round

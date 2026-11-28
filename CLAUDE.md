@@ -123,11 +123,12 @@ initiative.
 (everything built, every measured number with its source file, all
 standing decisions, and every open gap stated plainly).
 
-- Latest shipped version: **0.25.0** (committed: df21832 for
+- Latest shipped version: **0.26.0** (committed: df21832 for
   v0.18.0–v0.21.0, 783ca0b for v0.22.0, b4658a7 for v0.23.0,
-  83c7d11 for v0.24.0; v0.25.0 is the commit carrying this
-  line). Full suite: **574 passed, 3 flagged exceptions**
-  (577 total: all 554 pre-existing tests pass; of the 23
+  83c7d11 for v0.24.0, 8371f8d for v0.25.0; v0.26.0 is the
+  commit carrying this line). Full suite: **593 passed, 3
+  flagged exceptions**
+  (596 total: all 554 pre-existing tests pass; of the 23
   red-team tests from 2026-11-28, 20 pass and 3 class-3
   expectations are flagged as internally inconsistent with
   behaviour the same round pins as correct — the attacks

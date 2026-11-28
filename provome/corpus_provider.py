@@ -22,18 +22,27 @@ No network at query time, and no new dependency: the package
 stays standard-library only, so the ``.npz`` members are
 extracted to a scratch directory and memory-mapped, the
 ``.npy`` headers parsed directly, and search runs over the
-CSR columns the query's terms touch.  The extraction needs
-scratch space for the payloads (~2.4 GB at Item 53 scale);
-the scratch location is configurable (``scratch_dir``) for
-machines whose system temp area is small.  Query terms are
-weighted uniformly — per-term document frequencies are not
-stored in the index artefacts — while the document vectors
-carry the corpus idf and are L2-normalised, so a score is a
-cosine against a uniform-weight query.  Records are fetched
-by streaming scan of the corpus file (a record's row is its
-line number); at 2.2M records a scan is the honest cost of
-not having an offset index, and building one is future work,
-not a hidden step here.
+CSR columns the query's terms touch (one pass over the
+indices payload for all of the query's columns together).
+The extraction needs scratch space for the payloads
+(~2.4 GB at Item 53 scale); the scratch location is
+configurable (``scratch_dir``) for machines whose system
+temp area is small, and a configured scratch directory is
+also where the extraction and the record offset index are
+cached for reuse across provider instances.  Query terms
+are weighted uniformly — per-term document frequencies are
+not stored in the index artefacts — while the document
+vectors carry the corpus idf and are L2-normalised, so a
+score is a cosine against a uniform-weight query.
+Records are fetched through a line-offset index: the first
+fetch against a persistent scratch directory decompresses
+``corpus.jsonl.gz`` once into an uncompressed copy there,
+recording each line's byte offset, and later fetches seek
+directly to the wanted lines.  Without a persistent scratch
+directory, records are fetched by the original streaming
+scan of the corpus file (a record's row is its line number).
+Either way the bytes parsed for a row are the corpus's own
+line for that row, byte for byte.
 
 Trust rules, stated plainly:
 
@@ -94,14 +103,17 @@ from __future__ import annotations
 
 import ast
 import gzip
+import hashlib
 import json
 import math
 import mmap
+import os
 import re
 import shutil
 import struct
 import tempfile
 import zipfile
+from array import array
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -220,8 +232,23 @@ class _NpyArray:
     def __init__(self, npz_path: Path, member: str, scratch: Path) -> None:
         target = scratch / member
         with zipfile.ZipFile(npz_path) as archive:
-            with archive.open(member) as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+            info = archive.getinfo(member)
+            if not (
+                target.exists()
+                and target.stat().st_size == info.file_size
+            ):
+                # Extract to a per-process temp name and publish
+                # by rename, so a concurrent or interrupted
+                # extraction never leaves a partial file under
+                # the member's name; a complete file already
+                # extracted by an earlier instance is reused
+                # untouched (its size is the member's size).
+                staging = scratch / f"{member}.tmp-{os.getpid()}"
+                with archive.open(member) as src, staging.open(
+                    "wb"
+                ) as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                os.replace(staging, target)
         self._file = target.open("rb")
         self._mm = mmap.mmap(
             self._file.fileno(), 0, access=mmap.ACCESS_READ
@@ -280,6 +307,22 @@ class _NpyArray:
         self._file.close()
 
 
+def _cache_key(*paths: Path) -> str:
+    """Identity of the on-disk artefacts a cache was built from.
+
+    Path, size, and modification time of each artefact: if any
+    of them changes, the key changes and stale cache content is
+    simply never found under the new key.
+    """
+    digest = hashlib.sha1()
+    for path in paths:
+        stat = path.stat()
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()[:16]
+
+
 class _CorpusIndex:
     """The on-disk TF-IDF index: vocabulary, row ids, CSR matrix."""
 
@@ -295,57 +338,118 @@ class _CorpusIndex:
         self.doc_ids = json.loads(
             (index_dir / "doc_ids.json").read_text(encoding="utf-8")
         )
+        self._corpus_gz = corpus_dir / "corpus.jsonl.gz"
+        npz_path = index_dir / "tfidf_csr.npz"
         if scratch_dir is not None:
+            # A configured scratch directory is a persistent
+            # cache: the directory name is keyed on the index
+            # and corpus artefacts themselves, so provider
+            # instances (in this or a later process) reuse the
+            # extracted payloads and the record offset index
+            # built by the first instance, and a rebuilt corpus
+            # or index lands under a fresh key.
             Path(scratch_dir).mkdir(parents=True, exist_ok=True)
-            scratch = Path(
-                tempfile.mkdtemp(
-                    prefix="provome-corpus-index-", dir=scratch_dir
-                )
+            scratch = Path(scratch_dir) / (
+                "provome-corpus-index-"
+                + _cache_key(npz_path, self._corpus_gz)
             )
+            scratch.mkdir(parents=True, exist_ok=True)
+            self._persistent = True
         else:
             scratch = Path(
                 tempfile.mkdtemp(prefix="provome-corpus-index-")
             )
-        npz_path = index_dir / "tfidf_csr.npz"
+            self._persistent = False
+        self._scratch = scratch
         self._data = _NpyArray(npz_path, "data.npy", scratch)
         self._indices = _NpyArray(npz_path, "indices.npy", scratch)
         self._indptr = _NpyArray(npz_path, "indptr.npy", scratch)
         self.rows = len(self._indptr.values) - 1
-        self._corpus_gz = corpus_dir / "corpus.jsonl.gz"
+        self._row_by_pmid: Optional[dict] = None
+        self._copy_path: Optional[Path] = None
+        self._copy_offsets: Optional[array] = None
+        self._copy_unavailable = False
 
     # -- retrieval -------------------------------------------------
 
-    def _column_hits(self, column: int):
-        """Yield ``(row, value)`` for every entry in one CSR column.
+    def _positions_by_column(self, columns) -> dict:
+        """Entry positions per column: ``{column: [position, …]}``.
 
-        The column's positions are found by byte search over the
-        indices payload (C-speed scan, alignment- and
-        value-verified), and rows are resolved by walking the
-        row pointer monotonically — positions ascend, so the
-        pointer never rewinds.
+        One pass over the indices payload finds every column's
+        occurrences together, where the original code scanned
+        the whole payload once per column (``_NpyArray.find_all``
+        per column, then the same alignment and value checks
+        applied here).  The pass is a single alternation search
+        over the memory map; the positions collected for a
+        column are exactly the positions the per-column byte
+        search yielded — ascending, alignment-filtered, and
+        value-verified against the payload itself:
+
+        * A match's span is consumed by the search, so an
+          occurrence starting inside a matched span is never
+          reported.  An aligned occurrence can hide there only
+          when the match starts unaligned, and each match span
+          then contains exactly one aligned offset; that offset
+          is checked explicitly (the patch-up below).
+        * Occurrences outside every matched span are reached by
+          the scan one byte at a time and reported directly.
+
+        So the union of the reported matches and the patch-up
+        checks is the per-column search's yield, position for
+        position — the regression tests pin this against the
+        per-column reference on a payload crafted so that
+        occurrences overlap.
         """
-        indices = self._indices.values
-        data = self._data.values
-        indptr = self._indptr.values
-        base = self._indices.data_offset
-        pattern = struct.pack("<i", column)
-        row = 0
-        for pos in self._indices.find_all(pattern):
-            offset = pos - base
-            if offset % 4 != 0:
+        indices = self._indices
+        values = indices.values
+        itemsize = indices.itemsize
+        base = indices.data_offset
+        end = base + len(values) * itemsize
+        pattern_of = {
+            struct.pack("<i", column): column for column in columns
+        }
+        finder = re.compile(
+            b"|".join(re.escape(pattern) for pattern in pattern_of)
+        )
+        found: dict = {column: [] for column in columns}
+        unaligned_starts: list = []
+        for match in finder.finditer(indices._mm, base, end):
+            start = match.start()
+            offset = start - base
+            if offset % itemsize:
+                unaligned_starts.append(start)
                 continue
-            position = offset // 4
-            if indices[position] != column:
+            column = pattern_of[match.group()]
+            position = offset // itemsize
+            if values[position] == column:
+                found[column].append(position)
+        # Patch-up: the one aligned offset inside each unaligned
+        # match's span, checked the same way as a reported match.
+        for start in unaligned_starts:
+            aligned = start + (-(start - base) % itemsize)
+            if aligned + itemsize > end:
                 continue
-            while indptr[row + 1] <= position:
-                row += 1
-            yield row, data[position]
+            column = pattern_of.get(
+                bytes(indices._mm[aligned:aligned + itemsize])
+            )
+            if column is None:
+                continue
+            position = (aligned - base) // itemsize
+            if values[position] == column:
+                found[column].append(position)
+        for positions in found.values():
+            positions.sort()
+        return found
 
     def search(self, query_text: str, limit: int) -> list:
         """Top rows for a query: ``[(row, cosine_score)]``, best first.
 
         Only documents sharing a term with the query can score;
         a query with no in-vocabulary term retrieves nothing.
+        Scores accumulate per row in ascending column order and,
+        within a column, ascending entry order — the accumulation
+        order the original per-column scan used, so the sums are
+        the same floats, not merely close ones.
         """
         columns = sorted(
             {
@@ -356,10 +460,16 @@ class _CorpusIndex:
         )
         if not columns:
             return []
+        positions = self._positions_by_column(columns)
+        data = self._data.values
+        indptr = self._indptr.values
         scores: dict = {}
         for column in columns:
-            for row, value in self._column_hits(column):
-                scores[row] = scores.get(row, 0.0) + value
+            row = 0
+            for position in positions[column]:
+                while indptr[row + 1] <= position:
+                    row += 1
+                scores[row] = scores.get(row, 0.0) + data[position]
         query_norm = math.sqrt(len(columns))
         ranked = sorted(
             scores.items(), key=lambda pair: (-pair[1], pair[0])
@@ -372,20 +482,134 @@ class _CorpusIndex:
 
     # -- records ---------------------------------------------------
 
+    def row_for_pmid(self, pmid: str) -> Optional[int]:
+        """The corpus row carrying ``pmid``, or ``None``.
+
+        The first row, if the id were ever duplicated — the
+        semantics ``list.index`` gave the original linear scan
+        of ``doc_ids``, kept by building the map in row order
+        and never overwriting an entry.
+        """
+        if self._row_by_pmid is None:
+            mapping: dict = {}
+            for row, doc_id in enumerate(self.doc_ids):
+                if doc_id not in mapping:
+                    mapping[doc_id] = row
+            self._row_by_pmid = mapping
+        return self._row_by_pmid.get(pmid)
+
+    def _ensure_record_copy(self) -> bool:
+        """The uncompressed corpus copy + line offsets, if usable.
+
+        Built once into the persistent scratch cache (see
+        ``__init__``): the gzip is streamed a single time, each
+        line written to the copy as its byte offset is recorded.
+        Reuse is validated against the corpus file's size and
+        modification time and the built files' sizes.  Without
+        a persistent scratch directory, or if the build fails
+        (for example a full disk), this returns ``False`` and
+        record fetches use the streaming scan — the same
+        records, at the original cost.
+        """
+        if self._copy_offsets is not None:
+            return True
+        if not self._persistent or self._copy_unavailable:
+            return False
+        copy_path = self._scratch / "corpus.jsonl"
+        offsets_path = self._scratch / "corpus.offsets.bin"
+        meta_path = self._scratch / "corpus.copy.json"
+        gz_stat = self._corpus_gz.stat()
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if (
+                meta["gz_size"] == gz_stat.st_size
+                and meta["gz_mtime_ns"] == gz_stat.st_mtime_ns
+                and copy_path.stat().st_size == meta["copy_size"]
+                and offsets_path.stat().st_size == meta["lines"] * 8
+            ):
+                offsets = array("q")
+                with offsets_path.open("rb") as handle:
+                    offsets.frombytes(handle.read())
+                self._copy_path = copy_path
+                self._copy_offsets = offsets
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # no usable cache: build it below
+        try:
+            staging_copy = self._scratch / (
+                f"corpus.jsonl.tmp-{os.getpid()}"
+            )
+            staging_offsets = self._scratch / (
+                f"corpus.offsets.bin.tmp-{os.getpid()}"
+            )
+            offsets = array("q")
+            offset = 0
+            with gzip.open(self._corpus_gz, "rb") as src, (
+                staging_copy.open("wb")
+            ) as dst:
+                for line in src:
+                    offsets.append(offset)
+                    dst.write(line)
+                    offset += len(line)
+            with staging_offsets.open("wb") as handle:
+                offsets.tofile(handle)
+            os.replace(staging_copy, copy_path)
+            os.replace(staging_offsets, offsets_path)
+            meta_tmp = self._scratch / (
+                f"corpus.copy.json.tmp-{os.getpid()}"
+            )
+            meta_tmp.write_text(
+                json.dumps(
+                    {
+                        "gz_size": gz_stat.st_size,
+                        "gz_mtime_ns": gz_stat.st_mtime_ns,
+                        "lines": len(offsets),
+                        "copy_size": offset,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.replace(meta_tmp, meta_path)
+        except OSError:
+            self._copy_unavailable = True
+            return False
+        self._copy_path = copy_path
+        self._copy_offsets = offsets
+        return True
+
     def fetch_records(self, rows) -> dict:
-        """Stream the corpus once, returning ``{row: record}``.
+        """Return ``{row: record}`` for the wanted rows.
 
         A record's row is its line number in ``corpus.jsonl.gz``
         (the alignment the corpus build guarantees and the
-        provider re-checks).  Lines are parsed only for wanted
-        rows; an unparseable wanted line is simply absent from
-        the result, and the provider counts it as dropped.
+        provider re-checks).  With the offset index (see
+        :meth:`_ensure_record_copy`) each wanted line is read
+        directly from the uncompressed copy; otherwise the
+        corpus is streamed once and lines are parsed only for
+        wanted rows.  Either way an unparseable wanted line is
+        simply absent from the result, and the provider counts
+        it as dropped.
         """
         wanted = set(rows)
         if not wanted:
             return {}
+        if self._ensure_record_copy():
+            assert self._copy_path is not None
+            assert self._copy_offsets is not None
+            found: dict = {}
+            with self._copy_path.open("rb") as handle:
+                for row in sorted(wanted):
+                    if row < 0 or row >= len(self._copy_offsets):
+                        continue
+                    handle.seek(self._copy_offsets[row])
+                    line = handle.readline()
+                    try:
+                        found[row] = json.loads(line)
+                    except ValueError:
+                        pass  # corrupt line: absent, counted downstream
+            return found
         last = max(wanted)
-        found: dict = {}
+        found = {}
         with gzip.open(self._corpus_gz, "rb") as handle:
             for line_no, line in enumerate(handle):
                 if line_no in wanted:
@@ -425,10 +649,19 @@ class CorpusProvider:
             provider looks for records that survive filtering
             and re-verification.
         scratch_dir: Where the index payloads are extracted
-            for memory-mapping.  Defaults to the system temp
-            area; the extraction needs ~2.4 GB at Item 53
-            scale, so point this at a disk-backed directory
-            where temp space is small.
+            for memory-mapping, and where the persistent cache
+            lives: a directory keyed on the corpus artefacts
+            holding the extracted payloads plus the record
+            offset index (an uncompressed corpus copy with each
+            line's byte offset), reused by later provider
+            instances while the artefacts are unchanged.
+            Defaults to a fresh system-temp directory per
+            instance, where nothing is reused and record
+            fetches stream the corpus file.  The cache needs
+            ~2.4 GB for the payloads at Item 53 scale plus the
+            corpus's uncompressed size for the copy, so point
+            this at a disk-backed directory where temp space
+            is small.
 
     Attributes:
         dropped_records: Cumulative count of retrieved records
@@ -514,20 +747,17 @@ class CorpusProvider:
         guard, which must read the record's own text (a
         restatement of a database record often admits itself
         only in the abstract).  Returns ``""`` when the corpus
-        holds no such record.  The lookup streams the corpus
-        file to the record's row — the honest cost this module
-        already documents for record fetches — and is cached
-        per PMID on the instance.
+        holds no such record.  The lookup resolves the PMID to
+        its row through the index's id map and fetches that one
+        record (see :meth:`_CorpusIndex.fetch_records`), and is
+        cached per PMID on the instance.
         """
         pmid = str(pmid).strip()
         if pmid in self._abstract_cache:
             return self._abstract_cache[pmid]
         abstract = ""
         index = self._ensure_index()
-        try:
-            row = index.doc_ids.index(pmid)
-        except ValueError:
-            row = None
+        row = index.row_for_pmid(pmid)
         if row is not None:
             record = index.fetch_records([row]).get(row)
             if record is not None and str(
