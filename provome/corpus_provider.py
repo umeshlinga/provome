@@ -50,7 +50,24 @@ Trust rules, stated plainly:
   live re-confirmation: this provider makes no network
   calls, and does not repeat the pipeline evaluation's
   per-PMID live check against PubMed.  The item's notes say
-  which standard was applied.
+  which standard was applied.  (Where this provider is
+  composed into the cross-source chain, that chain *does*
+  re-confirm every corpus item against PubMed before it can
+  count toward a pass — see :mod:`provome.cross_source`.
+  Standalone, the corpus standard is what applies.)
+* **Direction is derived, not assumed.**  An item's
+  direction comes from the record's own title and abstract:
+  explicit negation language ("does not cause", "not
+  associated with", "benign and unrelated", …) makes it
+  REFUTES; anything else is SUPPORTS.  The pattern set is
+  deliberately narrow, and a paper arguing against the
+  claim in subtler words will still read as SUPPORTS —
+  the stated limit of the check (see ``_derive_direction``).
+* **One paper is one line.**  Records with identical
+  normalised title and abstract are the same paper, however
+  many PMIDs they arrive under; retrieval serves the first
+  and counts the rest (``duplicate_content_records``), so a
+  duplicated paper cannot inflate the evidence count.
 * **One source, one group.**  Every item's source is Europe
   PMC, registered in the source registry as exactly one
   independence group.  The cite-or-decline gate is unchanged
@@ -80,6 +97,7 @@ import gzip
 import json
 import math
 import mmap
+import re
 import shutil
 import struct
 import tempfile
@@ -105,6 +123,76 @@ __all__ = [
 #: :func:`provome.evidence.default_source_registry` as exactly
 #: one independence group.
 EUROPEPMC_SOURCE_ID = "europepmc"
+
+
+# ---------------------------------------------------------------------
+# Direction derivation (red-team round, 2026-11-28, class 4)
+#
+# Corpus items were originally stamped SUPPORTS unconditionally,
+# so a paper whose own title says the variant "does not cause"
+# the disease was counted as supporting the claim it refutes.
+# The direction is now derived from the record's own text: a
+# small set of explicit-negation patterns marks the item
+# REFUTES; everything else stays SUPPORTS.  The patterns are
+# deliberately narrow — they fire only on unambiguous negation
+# language about causation, association, or classification —
+# and the limit is stated plainly: a paper that argues against
+# the claim in subtler words will still be read as SUPPORTS
+# here.  That residual risk runs in the safe direction only
+# when combined with the chain's other checks (the cross-source
+# composite re-confirms every corpus item against PubMed
+# before it can count toward a pass; see
+# :mod:`provome.cross_source`).
+# ---------------------------------------------------------------------
+
+_REFUTATION_PATTERNS = (
+    re.compile(r"\bdoes not cause\b|\bdid not cause\b|\bdo not cause\b"),
+    re.compile(r"\bis not causal\b|\bnot causally\b"),
+    re.compile(r"\bnot associated with\b|\bno association\b"),
+    re.compile(r"\bnot linked to\b|\bno link between\b"),
+    re.compile(
+        r"\bbenign and unrelated\b|\bshown benign\b"
+        r"|\bclassified benign\b|\bclassified as benign\b"
+        r"|\bis benign\b"
+    ),
+    re.compile(
+        r"\bnot pathogenic\b|\bnon[- ]pathogenic\b"
+        r"|\bnot disease[- ]causing\b"
+    ),
+)
+
+
+def _derive_direction(title: str, abstract: str) -> SupportDirection:
+    """The direction a corpus record's own text supports.
+
+    REFUTES only on explicit negation language (see the
+    pattern list above); SUPPORTS otherwise.  The claim a
+    corpus item is read against is the topic's implicit one —
+    that the retrieved record supports the association its
+    retrieval was about — so a record that negates causation
+    or association, or classifies the variant benign, refutes
+    it.
+    """
+    text = f"{title} {abstract}".lower()
+    if any(pattern.search(text) for pattern in _REFUTATION_PATTERNS):
+        return SupportDirection.REFUTES
+    return SupportDirection.SUPPORTS
+
+
+def _content_key(title: str, abstract: str) -> tuple:
+    """Identity of a paper's content, for duplicate collapse.
+
+    The same paper planted (or ingested) under two PMIDs is
+    one evidence line, not two: the gate's deduplication keys
+    on the canonical citation (the PMID), so identical content
+    under different PMIDs would otherwise count once per PMID.
+    Two records are the same paper here when their normalised
+    title *and* abstract are identical.
+    """
+    return (
+        " ".join((title or "").lower().split()),
+        " ".join((abstract or "").lower().split()),
+    )
 
 
 # ---------------------------------------------------------------------
@@ -351,6 +439,12 @@ class CorpusProvider:
         out_of_division_records: Cumulative count of retrieved
             records skipped because their primary division is
             not this provider's division.
+        duplicate_content_records: Cumulative count of
+            retrieved records skipped because an identical
+            paper (same normalised title and abstract) was
+            already served in the same retrieval under another
+            PMID — one paper is one evidence line, however
+            many PMIDs it is planted under.
     """
 
     name = "europepmc-corpus"
@@ -380,8 +474,10 @@ class CorpusProvider:
         )
         self.dropped_records = 0
         self.out_of_division_records = 0
+        self.duplicate_content_records = 0
         self._index: Optional[_CorpusIndex] = None
         self._items_cache: dict = {}
+        self._abstract_cache: dict = {}
 
     # -- provider protocol ------------------------------------------
 
@@ -411,6 +507,38 @@ class CorpusProvider:
             self._index.close()
             self._index = None
 
+    def abstract_for_pmid(self, pmid: str) -> str:
+        """The abstract of the corpus record for ``pmid``.
+
+        Used by the cross-source composite's independence
+        guard, which must read the record's own text (a
+        restatement of a database record often admits itself
+        only in the abstract).  Returns ``""`` when the corpus
+        holds no such record.  The lookup streams the corpus
+        file to the record's row — the honest cost this module
+        already documents for record fetches — and is cached
+        per PMID on the instance.
+        """
+        pmid = str(pmid).strip()
+        if pmid in self._abstract_cache:
+            return self._abstract_cache[pmid]
+        abstract = ""
+        index = self._ensure_index()
+        try:
+            row = index.doc_ids.index(pmid)
+        except ValueError:
+            row = None
+        if row is not None:
+            record = index.fetch_records([row]).get(row)
+            if record is not None and str(
+                record.get("pmid") or ""
+            ).strip() == pmid:
+                text = record.get("abstract")
+                if isinstance(text, str):
+                    abstract = text
+        self._abstract_cache[pmid] = abstract
+        return abstract
+
     # -- internals ---------------------------------------------------
 
     @staticmethod
@@ -430,11 +558,27 @@ class CorpusProvider:
         records = index.fetch_records([row for row, _ in ranked])
         topic_key = self._topic_key(question_text)
         items: list = []
+        seen_content: set = set()
         for row, score in ranked:
+            record = records.get(row)
             item = self._record_to_item(
-                index, row, records.get(row), topic_key, score
+                index, row, record, topic_key, score
             )
-            if item is not None and len(items) < self.max_items:
+            if item is None:
+                continue
+            # One paper is one evidence line: identical content
+            # already served in this retrieval (the same paper
+            # under another PMID) is counted and skipped, so a
+            # duplicated paper cannot inflate the item count.
+            key = _content_key(
+                str(record.get("title") or ""),
+                str(record.get("abstract") or ""),
+            )
+            if key in seen_content:
+                self.duplicate_content_records += 1
+                continue
+            seen_content.add(key)
+            if len(items) < self.max_items:
                 items.append(item)
         return tuple(items)
 
@@ -480,6 +624,11 @@ class CorpusProvider:
             citation += f" {journal}."
         elif year:
             citation += f" {year}."
+        # Direction is derived from the record's own text,
+        # never assumed: explicit negation language in the
+        # title or abstract makes the item REFUTES (see
+        # _derive_direction for the patterns and their limits).
+        direction = _derive_direction(title, abstract)
         return EvidenceItem(
             item_id=f"corpus-pmid-{pmid}",
             topic_key=topic_key,
@@ -487,7 +636,7 @@ class CorpusProvider:
             source_id=EUROPEPMC_SOURCE_ID,
             citation=citation,
             kind=EvidenceKind.LITERATURE_REPORT,
-            direction=SupportDirection.SUPPORTS,
+            direction=direction,
             status=VerificationStatus.VERIFIED,
             locator=f"https://europepmc.org/article/MED/{pmid}",
             notes=(
@@ -496,6 +645,8 @@ class CorpusProvider:
                 f"score {score:.3f}; PMID, abstract, and index "
                 "alignment re-checked at read time under the "
                 "corpus standard — not a live re-confirmation. "
+                f"Direction ({direction.value}) derived from "
+                "the record's own title and abstract text. "
                 "Europe PMC is one independence group, so this "
                 "evidence alone cannot satisfy the gate's "
                 "two-group rule"

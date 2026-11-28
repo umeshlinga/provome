@@ -305,10 +305,36 @@ def _write_fixture_corpus(root, records) -> None:
 # ---------------------------------------------------------------------
 
 
+# PubMed's holdings in the fixture world: the three genuine
+# papers exist there under their real titles (the same records
+# the corpus serves), and nothing else does.  Since v0.25.0
+# the cross-source chain re-confirms every corpus item
+# against PubMed, so the fixture models PubMed honestly —
+# the house pattern of test_live.py's pubmed fixture —
+# instead of modelling a PubMed that holds nothing, which
+# was the unconfirmed world the pre-v0.25.0 chain lived in.
+_PUBMED_TITLES = {
+    record["pmid"]: record["title"] for record in _GENUINE_RECORDS
+}
+
+
+def _pubmed_esummary(url):
+    pmid = url.split("id=")[-1].split("&")[0]
+    title = _PUBMED_TITLES.get(pmid)
+    if title is None:
+        return {"result": {"uids": []}}
+    return {
+        "result": {
+            "uids": [pmid],
+            pmid: {"title": title, "pubtype": ["Journal Article"]},
+        }
+    }
+
+
 def cftr_transport(url, body=None):
     """Fixture ClinVar/gnomAD world for CFTR p.Phe508del."""
     if "db=pubmed" in url:
-        return {"result": {"uids": []}}
+        return _pubmed_esummary(url)
     if "esearch" in url:
         return {"esearchresult": {"idlist": ["12139"]}}
     if "esummary" in url:
@@ -357,7 +383,15 @@ def cftr_transport(url, body=None):
 
 
 def empty_transport(url, body=None):
-    """A structured world with nothing in it."""
+    """A structured world with nothing in it.
+
+    PubMed is a different service from the structured
+    (ClinVar/gnomAD) world: the genuine papers exist there
+    even when ClinVar and gnomAD hold nothing, and the
+    chain's re-confirmation (v0.25.0) consults it.
+    """
+    if "db=pubmed" in url:
+        return _pubmed_esummary(url)
     if "esearch" in url:
         return {"esearchresult": {"idlist": []}}
     if "europepmc" in url:

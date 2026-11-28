@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "provome"
-version = "0.24.0"
+version = "0.25.0"
 description = "Provome: one evidence engine with a cite-or-decline gate, shipped as three separate division products - Provome Human (provome-human), Provome Animal (provome-animal), and Provome Plant (provome-plant)."
 readme = "README.md"
 requires-python = ">=3.10"

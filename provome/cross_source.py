@@ -54,20 +54,66 @@ from arriving twice and posing as two groups):
    record (same PMID, same ClinVar Variation ID) under one
    topic and direction, whichever provider served them.  The
    composite relies on that machinery and does not bypass it.
-2. **Record-report absorption.**  A corpus paper whose title
-   names ClinVar *and* the variant (in any accepted notation)
-   presents itself as a report *of* the ClinVar record.  When
-   a ClinVar item for the same variant is in the merged set,
+2. **Record-report absorption.**  A corpus paper that
+   presents itself as a report *of* the ClinVar record is
+   the record's own echo, not an independent line.  When a
+   ClinVar item for the same variant is in the merged set,
    such a paper is carried as UNVERIFIED with an explanatory
    note and counted on the provider
    (``absorbed_duplicate_records``): it stays visible for
-   audit, but it cannot manufacture the second group.  The
-   rule is deliberately narrow — it fires only when the title
-   names both the database and the variant — and conservative
-   in the safe direction: it can demote a genuinely
-   independent paper whose title happens to name ClinVar and
-   the variant (a comparison study, say), which costs a
-   decline, never a false answer.
+   audit, but it cannot manufacture the second group.  An
+   item presents itself that way when its title names
+   ClinVar *and* the variant (in any accepted notation), or
+   when its abstract names both *and* describes the paper
+   as derived from the record — a restatement, a summary, a
+   report of the record.  The abstract rule (added in
+   v0.25.0, after the 2026-11-28 red-team round showed a
+   paraphrased title laundering a restated abstract) is
+   what stops the same restatement from evading the guard
+   by rewording its title.  Both rules are conservative in
+   the safe direction: they can demote a genuinely
+   independent paper whose text happens to match (a
+   comparison study, say), which costs a decline, never a
+   false answer.
+
+Two further checks the red-team round of 2026-11-28 forced
+(v0.25.0), stated with the same plainness:
+
+3. **Variant relevance.**  Corpus retrieval keys on the
+   whole question — gene, variant, disease — and its items
+   are retagged onto the parsed variant's topic.  Before
+   v0.25.0 nothing checked that a retagged paper was about
+   *that* variant: papers about CFTR Phe508del, retagged,
+   manufactured full answers for invented variants of the
+   same gene.  Now a verified corpus item counts for a
+   variant topic only when its own text names both the
+   topic's gene and the topic's variant (any accepted
+   notation for a protein topic; the ``c.`` notation itself
+   for a coding topic); anything else is carried as
+   UNVERIFIED and counted on the provider
+   (``off_topic_records``).  Gene-level Open Targets items
+   are the stated exception, and a bounded one: their
+   statements are gene–disease associations and say so,
+   they form a single group, and the gate's group rule
+   means they can never satisfy a variant question alone —
+   after this fix, every pass this chain can issue includes
+   variant-level evidence (a confirmed ClinVar item or a
+   relevance-checked corpus item), because no other stream
+   can supply the remaining groups.
+4. **Chain re-confirmation.**  The confirmers in
+   :mod:`provome.confirmation` existed but were run only by
+   the orchestra's verification agent; this chain never
+   called them, so corpus items counted on the corpus
+   standard alone and ClinVar items on the feed's own word.
+   The merged set is now re-confirmed before it is served:
+   corpus items against PubMed (PMID exists, title matches,
+   not retracted), ClinVar items against the served ClinVar
+   record with direction derived from it.  An item that
+   fails — an invented PMID, an altered title riding a real
+   PMID, a fabricated Variation ID the served record does
+   not support — is carried with its new status and the
+   confirmer's note, and never counts
+   (``confirmation_demotions``).
 
 What the guard does **not** catch — the residual risk, stated
 plainly: a ClinVar submission often rests on a published
@@ -172,6 +218,13 @@ counting rule.  Stated as a limit, then: a pass in which
 Open Targets supplies the second group means "a scored
 platform association stands alongside the other verified
 evidence", not "two wholly disjoint data lineages agree".
+One provenance case *is* closed, since v0.25.0: an
+association whose datasources are *solely* Europe PMC is
+not an integration of anything — it is the literature
+index restated — and the parse carries it UNVERIFIED, so
+it can never be the "second group" beside corpus
+literature (see
+:func:`provome.source_providers.parse_opentargets_associations`).
 The absorption guard above is *not* extended to Open
 Targets items: it targets items that present themselves as
 reports of the ClinVar record, and an Open Targets
@@ -207,8 +260,13 @@ import re
 from dataclasses import replace
 from typing import Callable, Optional, Sequence
 
-from .confirmation import variant_short_from_topic
-from .corpus_provider import CorpusProvider
+from .confirmation import (
+    clinvar_variation_id,
+    confirm_clinvar,
+    confirm_literature_detail,
+    variant_short_from_topic,
+)
+from .corpus_provider import EUROPEPMC_SOURCE_ID, CorpusProvider
 from .domains import Division
 from .evidence import EvidenceItem, SupportDirection, VerificationStatus
 from .live import (
@@ -250,6 +308,23 @@ ENSEMBL_SYMBOL_LOOKUP = "https://rest.ensembl.org/lookup/symbol"
 _ENSEMBL_GENE_ID_RE = re.compile(r"ENS[A-Z]*G\d+")
 _RUN_ACCESSION_RE = re.compile(r"\b[SED]RR\d{6,}\b")
 _PDB_ID_RE = re.compile(r"\b[0-9][A-Za-z0-9]{3}\b")
+_CORPUS_ITEM_ID_RE = re.compile(r"^corpus-pmid-(\d+)$")
+
+#: Words that mark a text as *derived from* a database record
+#: rather than an independent report: the independence guard's
+#: abstract rule fires only when a corpus item names ClinVar
+#: and the variant *and* describes itself with one of these
+#: (a restatement, a summary, a report of the record, …).
+_DERIVATION_MARKERS = (
+    "restat",
+    "summar",
+    "report",
+    "record",
+    "classification",
+    "submission",
+    "entry",
+    "derived",
+)
 
 
 def resolve_ensembl_gene_id(
@@ -315,10 +390,23 @@ class CrossSourceProvider:
     Attributes:
         absorbed_duplicate_records: Cumulative count of corpus
             items the independence guard carried as UNVERIFIED
-            because their titles present them as reports of
-            the ClinVar record served alongside them (see the
+            because they present themselves as reports of the
+            ClinVar record served alongside them (see the
             module docstring for exactly what the guard does
             and does not catch).
+        off_topic_records: Cumulative count of corpus items
+            carried as UNVERIFIED because, although retrieval
+            matched them to the question, their own text is
+            not about the variant the topic names (evidence
+            about one variant of a gene is not evidence about
+            another variant of that gene).
+        confirmation_demotions: Cumulative count of merged
+            items that lost VERIFIED status when the chain
+            re-confirmed them against their claimed source
+            (PubMed for corpus literature, ClinVar for ClinVar
+            items) — the red-team round of 2026-11-28 showed
+            the chain previously never ran the confirmers the
+            codebase already had.
     """
 
     name = "cross-source"
@@ -364,6 +452,8 @@ class CrossSourceProvider:
             else resolve_ensembl_gene_id
         )
         self.absorbed_duplicate_records = 0
+        self.off_topic_records = 0
+        self.confirmation_demotions = 0
         self._questions: dict = {}
         self._cache: dict = {}
         self._gene_ids: dict = {}
@@ -439,15 +529,31 @@ class CrossSourceProvider:
             replace(item, topic_key=topic_key)
             for item in self.corpus_provider.items_for_topic(corpus_key)
         ]
+        # Retagging is not relevance: retrieval matched these
+        # papers to the *question*, which names the gene and
+        # the disease as well as the variant, so a paper about
+        # a different variant of the same gene can arrive here.
+        # It is demoted before anything counts it (see
+        # _demote_off_topic_records).
+        corpus_items = self._demote_off_topic_records(
+            corpus_items, topic_key
+        )
         corpus_items = self._absorb_record_reports(
             corpus_items, structured, topic_key
         )
         opentargets_items = self._opentargets_items(topic_key)
-        result = (
+        merged = (
             tuple(structured)
             + tuple(corpus_items)
             + tuple(opentargets_items)
         )
+        # Nothing counts in this chain on a provider's word
+        # alone where an independent confirmer exists: corpus
+        # literature is re-confirmed against PubMed and ClinVar
+        # items against the served ClinVar record, through the
+        # structured side's transport (see
+        # _confirm_merged_items).
+        result = self._confirm_merged_items(merged, topic_key)
         self._cache[topic_key] = result
         return result
 
@@ -505,6 +611,109 @@ class CrossSourceProvider:
             if item.source_id in REGISTERED_SOURCE_IDS
         ]
 
+    # -- corpus item text ----------------------------------------------
+
+    @staticmethod
+    def _corpus_pmid(item: EvidenceItem) -> Optional[str]:
+        """The PMID a corpus item was built from, if recoverable."""
+        match = _CORPUS_ITEM_ID_RE.match(item.item_id or "")
+        return match.group(1) if match else None
+
+    def _abstract_of(self, item: EvidenceItem) -> str:
+        """The corpus record's abstract behind an item ("" if none).
+
+        The guard and the relevance check must read the
+        record's own text: a restatement of the ClinVar record
+        often admits itself only in the abstract, and a paper's
+        title alone does not always say which variant it is
+        about.  The corpus provider caches per PMID.
+        """
+        pmid = self._corpus_pmid(item)
+        if pmid is None:
+            return ""
+        return self.corpus_provider.abstract_for_pmid(pmid)
+
+    # -- variant relevance ----------------------------------------------
+
+    def _demote_off_topic_records(
+        self,
+        corpus_items: Sequence[EvidenceItem],
+        topic_key: str,
+    ) -> list:
+        """Demote corpus items that are not about the topic's variant.
+
+        Retrieval keys on the whole question — gene, variant,
+        disease — so the papers it returns for a variant topic
+        can be about a *different* variant of the same gene
+        (the red-team round of 2026-11-28 manufactured passes
+        for invented variants out of exactly that retagging).
+        Evidence about variant A is not evidence about variant
+        B: a verified corpus item counts for this topic only
+        when its own text (title, citation, abstract) names
+        both the topic's gene and the topic's variant — for a
+        protein topic, in any accepted notation (the live
+        provider's numbering-reconciliation rules); for a
+        coding (``c.``) topic, the ``c.`` notation itself.
+        Anything else is carried as UNVERIFIED with the reason
+        in its notes, and counted on the provider.
+
+        Stated limit: a paper that discusses the variant only
+        under a notation outside the accepted set (for a
+        ``c.`` topic, only under its protein name) is demoted
+        too.  That costs recall and can cost an answer; it
+        never manufactures one.
+        """
+        gene, _sep, hgvs = topic_key.partition(":")
+        short = variant_short_from_topic(topic_key)
+        if short is not None:
+            variant_forms = acceptable_notations(short)
+        else:
+            lowered = hgvs.strip().lower()
+            variant_forms = {lowered}
+            if lowered.startswith("c."):
+                variant_forms.add(lowered[2:])
+        gene_pattern = (
+            re.compile(rf"\b{re.escape(gene.strip().lower())}\b")
+            if gene.strip()
+            else None
+        )
+        merged: list = []
+        for item in corpus_items:
+            if not item.is_verified:
+                merged.append(item)
+                continue
+            text = (
+                f"{item.statement} {item.citation} "
+                f"{self._abstract_of(item)}"
+            ).lower()
+            about_variant = any(form in text for form in variant_forms)
+            about_gene = (
+                gene_pattern is not None
+                and gene_pattern.search(text) is not None
+            )
+            if about_variant and about_gene:
+                merged.append(item)
+                continue
+            self.off_topic_records += 1
+            merged.append(
+                replace(
+                    item,
+                    status=VerificationStatus.UNVERIFIED,
+                    notes=(
+                        item.notes
+                        + " Variant relevance (provome.cross_source): "
+                        "this literature item's own text does not "
+                        f"name both the gene ({gene}) and the "
+                        f"variant ({hgvs}) this topic asks about, "
+                        "so it is not evidence about this variant, "
+                        "however strongly retrieval matched it to "
+                        "the question; it is carried as UNVERIFIED "
+                        "and is not counted toward the gate."
+                    ).strip(),
+                )
+            )
+        return merged
+
     # -- the independence guard ---------------------------------------
 
     def _absorb_record_reports(
@@ -517,12 +726,18 @@ class CrossSourceProvider:
 
         See the module docstring for the full specification and
         its limits.  In short: when a ClinVar item is in the
-        merged set, a verified supporting corpus item whose
-        statement or citation names ClinVar and the variant (any
-        accepted notation) is the structured record's own
-        report, not an independent line; it is carried as
-        UNVERIFIED with the reason in its notes, and counted on
-        the provider.
+        merged set, a verified supporting corpus item that
+        presents itself as a report *of* that record is the
+        structured record's own report, not an independent
+        line; it is carried as UNVERIFIED with the reason in
+        its notes, and counted on the provider.  An item
+        presents itself that way when its title names ClinVar
+        and the variant (any accepted notation), or — the
+        paraphrase case the 2026-11-28 red-team round added —
+        when its abstract names ClinVar and the variant *and*
+        describes itself as derived from the record (a
+        restatement, a summary, a report of the record, …):
+        a paraphrased title cannot launder a restated abstract.
         """
         if not any(
             item.source_id == "clinvar" for item in structured_items
@@ -534,12 +749,24 @@ class CrossSourceProvider:
         accepted = acceptable_notations(short)
         merged: list = []
         for item in corpus_items:
-            text = f"{item.statement} {item.citation}".lower()
-            is_record_report = (
+            if not (
                 item.is_verified
                 and item.direction is SupportDirection.SUPPORTS
-                and "clinvar" in text
-                and any(form in text for form in accepted)
+            ):
+                merged.append(item)
+                continue
+            title_text = f"{item.statement} {item.citation}".lower()
+            abstract_text = self._abstract_of(item).lower()
+            is_record_report = (
+                "clinvar" in title_text
+                and any(form in title_text for form in accepted)
+            ) or (
+                "clinvar" in abstract_text
+                and any(form in abstract_text for form in accepted)
+                and any(
+                    marker in abstract_text
+                    for marker in _DERIVATION_MARKERS
+                )
             )
             if not is_record_report:
                 merged.append(item)
@@ -552,14 +779,155 @@ class CrossSourceProvider:
                     notes=(
                         item.notes
                         + " Independence guard (provome.cross_source): "
-                        "this literature item's title names ClinVar "
-                        "and the variant, so it presents itself as a "
+                        "this literature item presents itself as a "
                         "report of the same ClinVar record served "
-                        "here as structured evidence; it is carried "
-                        "as UNVERIFIED so one evidence line cannot "
-                        "manufacture a second independence group. "
-                        "It is not counted toward the gate."
+                        "here as structured evidence — its title "
+                        "names ClinVar and the variant, or its "
+                        "abstract describes it as a restatement, "
+                        "summary, or report of the ClinVar record; "
+                        "it is carried as UNVERIFIED so one "
+                        "evidence line cannot manufacture a second "
+                        "independence group. It is not counted "
+                        "toward the gate."
                     ).strip(),
                 )
             )
         return merged
+
+    # -- chain re-confirmation ------------------------------------------
+
+    def _confirm_merged_items(
+        self,
+        items: Sequence[EvidenceItem],
+        topic_key: str,
+    ) -> tuple:
+        """Re-confirm every merged item that has a confirmer.
+
+        The codebase's confirmers (:mod:`provome.confirmation`)
+        were, before v0.25.0, run only by the orchestra's
+        verification agent — the Copilot chain over this
+        composite never called them, so a corpus item counted
+        on the corpus standard alone and a ClinVar item on the
+        feed's own word (red-team round, 2026-11-28, classes 2
+        and 6).  The chain now holds its merged items to the
+        same standard the live literature path already meets:
+
+        * corpus (Europe PMC) items are re-confirmed against
+          PubMed via :func:`confirm_literature_detail` — the
+          PMID must exist there, its title must plausibly
+          match, and a retracted record fails;
+        * ClinVar items are re-confirmed against the served
+          ClinVar record via :func:`confirm_clinvar`, with the
+          direction *derived* from the served classification,
+          exactly as the verification agent does it.
+
+        Both run over the structured provider's transport —
+        the same injectable channel every fetch in this chain
+        uses, so fixtures stay deterministic and offline.  An
+        item that fails confirmation, or whose check cannot
+        be completed, keeps its place in the merged set with
+        its new status and the confirmer's note; it simply
+        never counts.  Sources with no confirmer are passed
+        through unchanged, and that gap is not hidden:
+        gnomAD items are NEUTRAL and never count toward a
+        pass; Open Targets items are hygiene-checked at parse
+        time instead (see
+        :func:`provome.source_providers.parse_opentargets_associations`).
+        """
+        transport = self.structured_provider.transport
+        return tuple(
+            self._confirm_item(item, transport, topic_key)
+            for item in items
+        )
+
+    def _confirm_item(
+        self, item: EvidenceItem, transport, topic_key: str
+    ) -> EvidenceItem:
+        if item.source_id == EUROPEPMC_SOURCE_ID:
+            return self._confirm_corpus_item(item, transport)
+        if item.source_id == "clinvar":
+            return self._confirm_clinvar_item(item, transport)
+        return item
+
+    def _confirm_corpus_item(
+        self, item: EvidenceItem, transport
+    ) -> EvidenceItem:
+        """Re-confirm one corpus item against PubMed."""
+        if item.is_failed or not item.is_verified:
+            # FAILED is sticky; anything not VERIFIED has
+            # already been demoted by an earlier stage and is
+            # not re-checked.
+            return item
+        pmid = self._corpus_pmid(item)
+        if pmid is None:
+            self.confirmation_demotions += 1
+            return replace(
+                item,
+                status=VerificationStatus.UNVERIFIED,
+                notes=(
+                    item.notes
+                    + " Chain re-confirmation "
+                    "(provome.cross_source): no PMID could be "
+                    "recovered from this corpus item, so it "
+                    "cannot be re-confirmed against PubMed; it "
+                    "is carried as UNVERIFIED and is not counted "
+                    "toward the gate."
+                ).strip(),
+            )
+        status, note, _retracted = confirm_literature_detail(
+            transport, pmid, item.statement
+        )
+        if status is item.status:
+            return item
+        self.confirmation_demotions += 1
+        return replace(
+            item,
+            status=status,
+            notes=(
+                item.notes
+                + " Chain re-confirmation "
+                f"(provome.cross_source): {note}"
+            ).strip(),
+        )
+
+    def _confirm_clinvar_item(
+        self, item: EvidenceItem, transport
+    ) -> EvidenceItem:
+        """Re-confirm one ClinVar item against the served record.
+
+        Mirrors the verification agent's discipline: FAILED is
+        sticky; an item with no recoverable Variation ID, or
+        on a topic naming no concrete protein change, is
+        outside the confirmer's remit and passes through; the
+        direction is the served record's, never the item's
+        own claim.
+        """
+        if item.is_failed:
+            return item
+        variation_id = clinvar_variation_id(
+            item.citation, item.locator or ""
+        )
+        if variation_id is None or (
+            variant_short_from_topic(item.topic_key) is None
+        ):
+            return item
+        status, direction, note = confirm_clinvar(
+            transport, variation_id, item.topic_key
+        )
+        new_direction = (
+            direction if direction is not None else item.direction
+        )
+        if status is item.status and new_direction is item.direction:
+            return item
+        if item.is_verified and status is not VerificationStatus.VERIFIED:
+            self.confirmation_demotions += 1
+        return replace(
+            item,
+            status=status,
+            direction=new_direction,
+            notes=(
+                item.notes
+                + " Chain re-confirmation "
+                f"(provome.cross_source): {note}"
+            ).strip(),
+        )

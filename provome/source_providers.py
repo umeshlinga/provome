@@ -66,11 +66,19 @@ What this module is, and is not:
   provider: an item is VERIFIED only when the record actually
   came back in this fetch and the fields used were present.
   A source that errors, times out, or returns nothing
-  contributes no items.  Per CLAUDE.md red line 2, there is
-  no independent confirmer for non-literature items today;
-  these items are trusted at the provider's word at the
-  item/gate layer, exactly like ClinVar and gnomAD items,
-  and this module does not describe that gap as closed.
+  contributes no items.  There is no independent confirmer
+  for these three sources' items (ClinVar items have one —
+  :func:`provome.confirmation.confirm_clinvar` — and since
+  v0.25.0 the cross-source chain runs it; Open Targets, ENA
+  and RCSB PDB items are still taken at the provider's word
+  at the item/gate layer, and this module does not describe
+  that gap as closed).  What the parse does enforce, since
+  v0.25.0, is payload hygiene: a payload for a different
+  gene than the one queried yields no items, a zero-score
+  association row yields no item, and an association whose
+  only datasource is Europe PMC is carried UNVERIFIED
+  because its lineage is the literature group's own (see
+  :func:`parse_opentargets_associations`).
 * Directions are derived from the served record, never
   assumed: an Open Targets item SUPPORTS the gene-disease
   association it reports (that association is the item's
@@ -174,6 +182,32 @@ def parse_opentargets_associations(
     Only rows carrying a disease id, a disease name and a
     numeric overall score become items; anything else in the
     payload is ignored rather than dressed up as evidence.
+
+    Three hygiene rules (red-team round, 2026-11-28), applied
+    here at parse time because this is where the payload's own
+    fields are still visible:
+
+    * **Wrong gene.**  If the payload names an
+      ``approvedSymbol`` different from the symbol that was
+      queried, the payload answers a different gene's query —
+      a poisoned or confused mirror can serve exactly that —
+      and none of its rows may be served for this gene: the
+      parse returns no items at all.
+    * **Zero score.**  A row whose overall association score
+      is zero is the Platform reporting *no* association.
+      It is not supporting evidence and becomes no item; a
+      "reports an association ... score of 0.000" statement
+      would misstate the record.
+    * **Literature-only lineage.**  Independence is judged by
+      underlying provenance, not by which API served the row.
+      If a row's datasources are present and *every* one of
+      them is Europe PMC, the association is a restatement of
+      the literature index the corpus group already
+      represents; the item is carried as UNVERIFIED with the
+      reason in its notes, so it can never pose as an
+      independent second group alongside Europe PMC
+      literature evidence.  A row with no datasource list has
+      unknown lineage and is not demoted on suspicion.
     """
     stamp = fetched_on.isoformat()
     try:
@@ -182,6 +216,10 @@ def parse_opentargets_associations(
     except (KeyError, TypeError):
         return ()
     served_symbol = target.get("approvedSymbol") or symbol
+    if served_symbol.strip().lower() != symbol.strip().lower():
+        # The payload is for a different gene than the one
+        # queried; none of it may count for this question.
+        return ()
     items: list[EvidenceItem] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -193,6 +231,10 @@ def parse_opentargets_associations(
         if not disease_id or not disease_name or not isinstance(
             score, (int, float)
         ):
+            continue
+        if score <= 0:
+            # The Platform reports no association for this
+            # row; a zero score is not support.
             continue
         datasources = row.get("datasourceScores") or []
         named = [
@@ -209,6 +251,24 @@ def parse_opentargets_associations(
             if named
             else ""
         )
+        datasource_ids = {
+            str(entry.get("id")).strip().lower()
+            for entry in datasources
+            if isinstance(entry, dict) and entry.get("id")
+        }
+        status = VerificationStatus.VERIFIED
+        if datasource_ids and datasource_ids == {"europepmc"}:
+            status = VerificationStatus.UNVERIFIED
+            notes = (
+                notes
+                + " Independence (provome.source_providers): "
+                "this association's only datasource is Europe "
+                "PMC literature — the same underlying literature "
+                "the corpus evidence group represents — so it is "
+                "carried as UNVERIFIED and cannot count as an "
+                "independent second group alongside Europe PMC "
+                "literature evidence."
+            ).strip()
         items.append(
             EvidenceItem(
                 item_id=f"opentargets-{ensembl_id}-{disease_id}",
@@ -228,7 +288,7 @@ def parse_opentargets_associations(
                 ),
                 kind=EvidenceKind.CURATED_CLASSIFICATION,
                 direction=SupportDirection.SUPPORTS,
-                status=VerificationStatus.VERIFIED,
+                status=status,
                 locator=(
                     f"https://platform.opentargets.org/"
                     f"disease/{disease_id}"

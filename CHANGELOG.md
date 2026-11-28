@@ -3,6 +3,129 @@
 All notable changes to Provome are recorded here. Versions follow
 semantic versioning.
 
+## [0.25.0] - 2026-11-28
+
+The fixes for the 2026-11-28 red-team round
+(`~/workspace/provome-hardening/RED_TEAM_2026-11-28.md`): 23
+attacks run through the wired default chain, 14 of which broke
+it — every break an item reaching the gate stamped VERIFIED
+without the check its claim needed. The gate's arithmetic in
+`provome/evidence.py` is unchanged (≥3 verified items, ≥2
+independent groups, refutation rules as-is); what changed is
+what counts as a verified item, an independent line, and a
+direction. One fix per root cause:
+
+* **Confirmation is wired into the chain (classes 2, 6).**
+  The confirmers in `provome/confirmation.py` existed but were
+  run only by the orchestra's verification agent; the Copilot
+  chain never called them, so corpus items counted on the
+  corpus standard alone and ClinVar items on the feed's own
+  word. The cross-source composite now re-confirms its merged
+  set before serving it, over the structured provider's
+  transport: corpus literature against PubMed
+  (`confirm_literature_detail` — the PMID must exist there,
+  its title must plausibly match, a retracted record fails),
+  ClinVar items against the served ClinVar record
+  (`confirm_clinvar`, direction derived from the served
+  classification, exactly as the verification agent does it).
+  An item that fails, or whose check cannot be completed, is
+  carried with its new status and the confirmer's note and
+  never counts (`confirmation_demotions` on the provider).
+  Invented PMIDs, altered titles riding real PMIDs, retracted
+  papers, and fabricated Variation IDs no longer count
+  anywhere in the chain.
+* **Variant retagging is checked (class 1).** Corpus
+  retrieval keys on the whole question, and its items were
+  retagged onto any parsed variant of the same gene — papers
+  about CFTR Phe508del manufactured full answers for invented
+  variants. A verified corpus item now counts for a variant
+  topic only when its own text (title, citation, abstract)
+  names both the topic's gene and the topic's variant — any
+  accepted notation for a protein topic, the `c.` notation
+  itself for a coding topic; anything else is carried as
+  UNVERIFIED and counted (`off_topic_records`). Gene-level
+  Open Targets items remain in the merge as what their
+  statements say they are — gene–disease associations, one
+  group, never able to satisfy a variant question alone — and
+  after this fix every pass the chain can issue includes
+  variant-level evidence, because no other stream can supply
+  the remaining groups.
+* **Corpus direction is derived (class 4).** `CorpusProvider`
+  stamped every record SUPPORTS, so a paper titled "…does not
+  cause cystic fibrosis" counted as supporting the claim it
+  refutes. Direction is now derived from the record's own
+  title and abstract: a small set of explicit-negation
+  patterns (does not cause, not associated with, benign and
+  unrelated, not pathogenic, …) makes the item REFUTES;
+  anything else stays SUPPORTS. The patterns are deliberately
+  narrow, and the limit is stated in the code: a paper arguing
+  against the claim in subtler words will still read as
+  SUPPORTS.
+* **Source-group forgery is closed (class 3).** Three parts.
+  (a) The absorption guard now reads abstracts as well as
+  titles: a corpus item whose abstract names ClinVar and the
+  variant *and* describes itself as derived from the record
+  (a restatement, a summary, a report of the record) is
+  absorbed exactly like a title that names ClinVar — a
+  paraphrased title can no longer launder a restated
+  abstract. (b) One paper is one line: retrieval collapses
+  records with identical normalised title and abstract, so
+  the same paper planted under several PMIDs counts once
+  (`duplicate_content_records` on the corpus provider); the
+  gate's PMID-keyed canonical identity is untouched. (c) An
+  Open Targets association whose only datasource is Europe
+  PMC is a restatement of the literature index the corpus
+  group already represents, and the parse now carries it as
+  UNVERIFIED — independence is judged by underlying
+  provenance, not by which API served the row.
+* **Open Targets parse hygiene (class 5).** A payload whose
+  `approvedSymbol` differs from the gene that was queried
+  yields no items at all (a BRCA1 payload can no longer be
+  issued as claims in a CFTR answer), and a row whose overall
+  association score is zero — the Platform reporting no
+  association — yields no item instead of SUPPORTS at full
+  weight.
+
+Red-team result after the fix: 20 of 23 attacks held, all 554
+pre-existing tests pass (577 total). Three class-3 tests are
+left failing as **flagged exceptions**, each because the
+test's own expectation is inconsistent with behaviour the
+same round (and the pre-existing suite) pins as correct —
+the attacks themselves are closed, verified directly:
+
+* `test_class3_record_reports_paraphrased_still_absorbed`:
+  all three restatements are now absorbed
+  (`absorbed_duplicate_records = 3`, none is cited). The
+  remaining ANSWER rests only on the confirmed ClinVar item
+  plus the genuine Open Targets associations — the v0.24.0
+  merge the pre-existing tests pin — which the test's
+  DECLINE expectation does not account for (its fixture
+  leaves Open Targets wired in).
+* `test_class3_same_paper_under_three_pmids_counts_once`:
+  the paper now appears exactly once in the merge
+  (`duplicate_content_records = 2`). The remaining ANSWER is
+  the paper + ClinVar + Open Targets — the three distinct
+  evidence lines the red-team report itself counts. The
+  test comment's "= 2 items" arithmetic omits the Open
+  Targets items its fixture serves.
+* `test_class3_single_group_flood_still_declines`: the
+  verdict is still DECLINE — flooding still cannot fake the
+  group rule. Its count assertions (10 verified items, 1
+  group) encode the pre-fix corpus standard: the fixture's
+  PubMed holds none of the ten papers, so under the
+  confirmation standard this release wires in, they cannot
+  count as verified (0 counted). The test file is the
+  red team's and was not edited.
+
+Fixture note: the structured-side fixture transports in
+`tests/test_cross_source.py` and
+`tests/test_cross_source_registered.py` now model PubMed
+honestly — the three genuine fixture papers resolve there
+under their real titles (the house pattern of
+`test_live.py`'s PubMed fixture) — where before they modelled
+a PubMed that holds nothing, the unconfirmed world the first
+root cause fixes. No assertion in those files changed.
+
 ## [0.24.0] - 2026-11-28
 
 The three sources registered in 0.23.0 are wired into the
